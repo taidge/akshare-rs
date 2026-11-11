@@ -1235,6 +1235,27 @@ impl AkShareClient {
         begin_date: Option<&str>,
         end_date: Option<&str>,
     ) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+        if security.is_some_and(|code| code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(Error::invalid_input(
+                "notice security must be a six-digit stock code",
+            ));
+        }
+        let parse_date = |date: Option<&str>| {
+            date.map(|d| {
+                if d.len() != 8 || !d.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(Error::invalid_input("notice dates must use YYYYMMDD"));
+                }
+                chrono::NaiveDate::parse_from_str(d, "%Y%m%d")
+                    .map_err(|e| Error::invalid_input(e.to_string()))
+            })
+            .transpose()
+        };
+        let begin = parse_date(begin_date)?;
+        let end = parse_date(end_date)?;
+        if begin.zip(end).is_some_and(|(begin, end)| begin > end) {
+            return Err(Error::invalid_input("notice date range is reversed"));
+        }
         let report_map: HashMap<&str, &str> = [
             ("全部", "0"),
             ("财务报告", "1"),
@@ -1252,6 +1273,8 @@ impl AkShareClient {
 
         let mut all_items = Vec::new();
         let mut page = 1_u64;
+        let mut expected_total = None;
+        let mut seen = std::collections::HashSet::new();
 
         loop {
             let ps = "100";
@@ -1287,36 +1310,69 @@ impl AkShareClient {
                 params.push(("end_time", ed_str.as_str()));
             }
 
-            let resp = self
-                .get("https://np-anotice-stock.eastmoney.com/api/security/ann")
-                .query(&params)
-                .send()
-                .await?
-                .error_for_status()?;
-
-            let payload: serde_json::Value = resp.json().await?;
+            let params = params
+                .into_iter()
+                .map(|(k, v)| (k, v.to_owned()))
+                .collect::<Vec<_>>();
+            let payload = self
+                .stock_json(
+                    "https://np-anotice-stock.eastmoney.com/api/security/ann",
+                    &params,
+                )
+                .await?;
+            if payload["success"] == serde_json::Value::Bool(false)
+                || payload["success"].as_i64() == Some(0)
+            {
+                return Err(Error::upstream("notice service returned an error status"));
+            }
             let total_hits = payload
                 .pointer("/data/total_hits")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-
+                .ok_or_else(|| Error::decode("notice total missing"))?;
+            if total_hits > 10_000 || expected_total.is_some_and(|total| total != total_hits) {
+                return Err(Error::decode("notice total changed or exceeds limit"));
+            }
+            expected_total = Some(total_hits);
             let list = payload
                 .pointer("/data/list")
-                .and_then(|v| v.as_array())
+                .and_then(serde_json::Value::as_array)
                 .cloned()
-                .unwrap_or_default();
-
+                .ok_or_else(|| Error::decode("notice list missing"))?;
+            if list.len() > 100 || (list.is_empty() && total_hits > 0) {
+                return Err(Error::decode("notice page incomplete or too large"));
+            }
             for item in list {
                 if let serde_json::Value::Object(mut map) = item {
                     // Extract stock code from codes array
                     let codes = map.remove("codes").unwrap_or_default();
-                    let stock_code = if let Some(arr) = codes.as_array() {
-                        arr.first()
-                            .map(|c| c.str_or(&["stock_code"], ""))
-                            .unwrap_or_default()
+                    let code_items = codes
+                        .as_array()
+                        .ok_or_else(|| Error::decode("notice security identities missing"))?;
+                    let stock_code = if let Some(requested) = security {
+                        code_items
+                            .iter()
+                            .find_map(|item| {
+                                item.get("stock_code")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|code| *code == requested)
+                            })
+                            .ok_or_else(|| {
+                                Error::decode("notice does not contain requested security")
+                            })?
+                            .to_owned()
                     } else {
-                        String::new()
+                        code_items
+                            .first()
+                            .map(|item| item.str_or(&["stock_code"], ""))
+                            .unwrap_or_default()
                     };
+                    let article = map
+                        .get("art_code")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| Error::decode("notice article identity missing"))?;
+                    if !seen.insert(article.to_owned()) {
+                        return Err(Error::decode("duplicate notice article or repeated page"));
+                    }
 
                     // Extract column name
                     let columns = map.remove("columns").unwrap_or_default();
@@ -1342,7 +1398,13 @@ impl AkShareClient {
             }
 
             let total_pages = total_hits.div_ceil(100);
+            if all_items.len() as u64 > total_hits {
+                return Err(Error::decode("notice count exceeds total"));
+            }
             if page >= total_pages || total_hits == 0 {
+                if all_items.len() as u64 != total_hits {
+                    return Err(Error::decode("notice pagination incomplete"));
+                }
                 break;
             }
             page += 1;
