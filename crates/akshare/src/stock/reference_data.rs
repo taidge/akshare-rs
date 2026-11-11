@@ -63,7 +63,11 @@ impl AkShareClient {
         report: &str,
         date_key: &str,
     ) -> Result<Vec<Value>> {
-        let filter = format!("(SECUCODE=\"{symbol}\")");
+        let filter = if report == "RPT_SHAREBONUS_DET" {
+            format!("(SECUCODE=\"{symbol}\")(ASSIGN_PROGRESS=\"实施分配\")")
+        } else {
+            format!("(SECUCODE=\"{symbol}\")")
+        };
         let mut result = Vec::new();
         let mut seen = BTreeSet::new();
         let mut expected = None;
@@ -138,6 +142,13 @@ impl AkShareClient {
             tokio::time::sleep(std::time::Duration::from_millis(180)).await;
         }
         Err(Error::decode("financial pagination exceeded bounds"))
+    }
+    /// Current reported values, not an archive of original point-in-time vintages.
+    /// Complete implemented distributions; actual cash/share settlement dates may be absent.
+    pub async fn stock_implemented_distributions_em(&self, symbol: &str) -> Result<Vec<Value>> {
+        secucode(symbol)?;
+        self.reference_financial_table(symbol, "RPT_SHAREBONUS_DET", "EX_DIVIDEND_DATE")
+            .await
     }
     /// Current reported values, not an archive of original point-in-time vintages.
     /// All three reports are paginated and bound to the requested security.
