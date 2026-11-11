@@ -58,7 +58,7 @@ fn infer_a_share_exchange(code: &str) -> Option<&'static str> {
         // Shenzhen: 00xxxx, 30xxxx (ChiNext), 200xxx (B-share)
         s if s.starts_with('0') || s.starts_with('3') || s.starts_with('2') => Some("SZ"),
         // Beijing: 8xxxxx, 4xxxxx
-        s if s.starts_with('8') || s.starts_with('4') => Some("BJ"),
+        s if s.starts_with('8') || s.starts_with('4') || s.starts_with("920") => Some("BJ"),
         _ => None,
     }
 }
@@ -96,7 +96,12 @@ pub fn tencent_market_symbol(symbol: &str) -> crate::error::Result<String> {
     })?;
     let prefix = match suffix {
         "SH" => "sh",
-        "SZ" | "BJ" => "sz",
+        "SZ" => "sz",
+        "BJ" => {
+            return Err(crate::Error::unsupported_market(
+                "Tencent history for Beijing is not supported",
+            ));
+        }
         _ => {
             return Err(crate::error::Error::invalid_input(format!(
                 "unsupported suffix: {suffix}"

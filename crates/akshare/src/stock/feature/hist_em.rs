@@ -114,6 +114,101 @@ impl AkShareClient {
         .await
     }
 
+    /// Eastmoney-only A-share history. Never silently falls back to another vendor.
+    /// Prices are yuan; volume is vendor lots (100 shares). Empty verified ranges are valid.
+    /// Accepts YYYYMMDD or YYYY-MM-DD; paginate ranges longer than 731 calendar days.
+    pub async fn stock_zh_a_hist_em(
+        &self,
+        symbol: &str,
+        period: &str,
+        adjust: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<Vec<HistData>> {
+        let secid = eastmoney_secid(symbol)?;
+        let (start, end) = crate::stock::history_validation::date_range(start_date, end_date)?;
+        if !matches!(adjust, "" | "qfq" | "hfq") {
+            return Err(Error::invalid_input("invalid adjustment"));
+        }
+        let value = self
+            .stock_json(
+                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                &[
+                    ("secid", secid.clone()),
+                    ("klt", daily_klt(period)?.into()),
+                    ("fqt", adjust_fqt(adjust).into()),
+                    ("lmt", "640".into()),
+                    ("beg", start.format("%Y%m%d").to_string()),
+                    ("end", end.format("%Y%m%d").to_string()),
+                    ("fields1", "f1,f2,f3,f4,f5,f6".into()),
+                    (
+                        "fields2",
+                        "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61".into(),
+                    ),
+                ],
+            )
+            .await?;
+        if value["rc"].as_i64() != Some(0) {
+            return Err(Error::upstream("eastmoney history status error"));
+        }
+        let (market, code) = secid
+            .split_once('.')
+            .ok_or_else(|| Error::invalid_input("invalid secid"))?;
+        let data = &value["data"];
+        if data["code"].as_str() != Some(code)
+            || data["market"].as_i64() != market.parse::<i64>().ok()
+        {
+            return Err(Error::decode("eastmoney history identity mismatch"));
+        }
+        let rows = data["klines"]
+            .as_array()
+            .ok_or_else(|| Error::decode("missing eastmoney klines"))?;
+        let mut items = Vec::new();
+        for row in rows {
+            let fields = parse_csv_line(
+                row.as_str()
+                    .ok_or_else(|| Error::decode("invalid eastmoney row"))?,
+            );
+            if fields.len() < 11 {
+                return Err(Error::decode("incomplete eastmoney row"));
+            }
+            let number = |n: usize| {
+                crate::stock::history_validation::number(&serde_json::Value::String(
+                    fields[n].into(),
+                ))
+            };
+            let item = HistData {
+                trade_date: fields[0].into(),
+                open: number(1)?,
+                close: number(2)?,
+                high: number(3)?,
+                low: number(4)?,
+                volume: number(5)?,
+                amount: parse_f64_safe(fields[6]),
+                amplitude_pct: parse_f64_safe(fields[7]),
+                change_pct: parse_f64_safe(fields[8]),
+                change_amount: parse_f64_safe(fields[9]),
+                turnover_rate: parse_f64_safe(fields[10]),
+            };
+            crate::stock::history_validation::validate_bar(
+                &item.trade_date,
+                item.open,
+                item.close,
+                item.high,
+                item.low,
+                item.volume,
+                start,
+                end,
+            )?;
+            items.push(item);
+        }
+        items.sort_by(|a, b| a.trade_date.cmp(&b.trade_date));
+        if items.windows(2).any(|p| p[0].trade_date == p[1].trade_date) {
+            return Err(Error::decode("duplicate trade date"));
+        }
+        Ok(items)
+    }
+
     /// 东方财富-沪深A股-分时行情
     pub async fn stock_zh_a_hist_min(
         &self,

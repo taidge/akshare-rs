@@ -1,3 +1,12 @@
+> taidge fork: repairs full A-share directory pagination (SH/SZ/BJ, listing date and industry),
+> Tencent numeric-string/date parsing, and adds `stock_zh_a_hist_em` (Eastmoney only) plus
+> `stock_zh_a_hist_sourced` (explicit vendor identity and optional source pinning).
+> Daily history requests accept YYYYMMDD / YYYY-MM-DD and at most 731 calendar days per
+> request. Persist and checkpoint ranges in the caller for full listing histories.
+> Both vendors return volume in lots; convert to shares once in the application adapter.
+> Repaired endpoints use shared pacing, bounded response bodies and transient retries.
+> Regression tests: `cargo test -p akshare --no-default-features --features mod-stock --test stock_directory_history`.
+
 # akshare-rs
 
 [![Crates.io](https://img.shields.io/crates/v/akshare)](https://crates.io/crates/akshare)

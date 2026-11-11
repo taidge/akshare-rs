@@ -146,6 +146,13 @@ pub struct ZhAHistTx {
     pub volume: f64,
 }
 
+/// Historical daily bars with explicit vendor identity. Volume remains in vendor lots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourcedHistory {
+    pub source: String,
+    pub bars: Vec<ZhAHistTx>,
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -594,63 +601,112 @@ impl AkShareClient {
         end_date: &str,
         adjust: &str,
     ) -> Result<Vec<ZhAHistTx>> {
-        #[derive(Deserialize)]
-        struct Resp {
-            data: Option<serde_json::Value>,
-        }
         let ts = crate::market::tencent_market_symbol(symbol)?;
-        let adjust_suffix = match adjust {
-            "" => "",
-            "qfq" => "qfq",
-            "hfq" => "hfq",
-            _ => return Err(Error::invalid_input(format!("invalid adjust: {adjust}"))),
-        };
-
-        let url = format!(
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={ts},day,{start_date},{end_date},640,{adjust_suffix}"
-        );
-
-        let resp: Resp = self.get(&url).send().await?.json().await?;
-        let data = resp
-            .data
-            .ok_or_else(|| Error::upstream("empty tencent hist data"))?;
-
-        let ts_lower = ts.to_lowercase();
-        let kline_key = match adjust {
+        let (start, end) = crate::stock::history_validation::date_range(start_date, end_date)?;
+        if !matches!(adjust, "" | "qfq" | "hfq") {
+            return Err(Error::invalid_input("invalid adjustment"));
+        }
+        let param = format!("{ts},day,{start},{end},640,{adjust}");
+        let value = self
+            .stock_json(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                &[("param", param)],
+            )
+            .await?;
+        if value["code"].as_i64() != Some(0) {
+            return Err(Error::upstream("tencent history status error"));
+        }
+        let key = match adjust {
             "qfq" => "qfqday",
             "hfq" => "hfqday",
             _ => "day",
         };
+        let rows = value["data"][&ts][key]
+            .as_array()
+            .ok_or_else(|| Error::decode("missing requested symbol or adjustment"))?;
+        let mut items = Vec::new();
+        for row in rows {
+            let fields = row
+                .as_array()
+                .ok_or_else(|| Error::decode("invalid tencent row"))?;
+            if fields.len() < 6 {
+                return Err(Error::decode("incomplete tencent row"));
+            }
+            let number = |n: usize| crate::stock::history_validation::number(&fields[n]);
+            let item = ZhAHistTx {
+                date: fields[0]
+                    .as_str()
+                    .ok_or_else(|| Error::decode("missing trade date"))?
+                    .into(),
+                open: number(1)?,
+                close: number(2)?,
+                high: number(3)?,
+                low: number(4)?,
+                volume: number(5)?,
+            };
+            crate::stock::history_validation::validate_bar(
+                &item.date,
+                item.open,
+                item.close,
+                item.high,
+                item.low,
+                item.volume,
+                start,
+                end,
+            )?;
+            items.push(item);
+        }
+        items.sort_by(|a, b| a.date.cmp(&b.date));
+        if items.windows(2).any(|p| p[0].date == p[1].date) {
+            return Err(Error::decode("duplicate trade date"));
+        }
+        // An explicitly returned empty day array is a valid suspension/non-trading range.
+        Ok(items)
+    }
 
-        let klines = data
-            .get(&ts_lower)
-            .and_then(|v| v.get(kline_key).or_else(|| v.get("day")))
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let items: Vec<ZhAHistTx> = klines
-            .iter()
-            .filter_map(|entry| {
-                let arr = entry.as_array()?;
-                if arr.len() < 6 {
-                    return None;
+    /// Source-aware A-share daily history. With no pinned source, prefer Tencent for SH/SZ,
+    /// then Eastmoney; Beijing uses Eastmoney. A pinned source never silently changes.
+    pub async fn stock_zh_a_hist_sourced(
+        &self,
+        symbol: &str,
+        start: &str,
+        end: &str,
+        source: Option<&str>,
+    ) -> Result<SourcedHistory> {
+        let normalized = crate::market::normalize_a_share_symbol(symbol)
+            .ok_or_else(|| Error::invalid_input("invalid A-share symbol"))?;
+        if source.is_some_and(|s| !matches!(s, "tencent" | "eastmoney")) {
+            return Err(Error::invalid_input("unsupported history source"));
+        }
+        if source == Some("tencent") || (source.is_none() && !normalized.ends_with(".BJ")) {
+            match self.stock_zh_a_hist_tx(&normalized, start, end, "").await {
+                Ok(bars) => {
+                    return Ok(SourcedHistory {
+                        source: "tencent".into(),
+                        bars,
+                    });
                 }
-                Some(ZhAHistTx {
-                    date: arr[0].as_str().unwrap_or("").to_string(),
-                    open: arr[1].as_f64().unwrap_or(0.0),
-                    close: arr[2].as_f64().unwrap_or(0.0),
-                    high: arr[3].as_f64().unwrap_or(0.0),
-                    low: arr[4].as_f64().unwrap_or(0.0),
-                    volume: arr[5].as_f64().unwrap_or(0.0),
-                })
+                Err(e) if source.is_some() => return Err(e),
+                Err(_) => {}
+            }
+        }
+        let bars = self
+            .stock_zh_a_hist_em(&normalized, "daily", "", start, end)
+            .await?
+            .into_iter()
+            .map(|b| ZhAHistTx {
+                date: b.trade_date,
+                open: b.open,
+                close: b.close,
+                high: b.high,
+                low: b.low,
+                volume: b.volume,
             })
             .collect();
-
-        if items.is_empty() {
-            return Err(Error::not_found("tencent hist returned no data"));
-        }
-        Ok(items)
+        Ok(SourcedHistory {
+            source: "eastmoney".into(),
+            bars,
+        })
     }
 
     /// Get Tencent tick data.

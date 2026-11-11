@@ -12,6 +12,7 @@ pub struct AkShareClient {
     pub(crate) tushare_token: Option<String>,
     /// When set, all HTTP requests are redirected to this base URL (for testing).
     pub mock_uri: Option<String>,
+    pub(crate) stock_pacing: std::sync::Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl AkShareClient {
@@ -193,6 +194,51 @@ impl AkShareClientBuilder {
             http,
             tushare_token: self.tushare_token,
             mock_uri: None,
+            stock_pacing: Default::default(),
         }
+    }
+}
+
+impl AkShareClient {
+    /// Shared pacing and bounded retries for stock directory/history endpoints.
+    pub(crate) async fn stock_json(
+        &self,
+        url: &str,
+        query: &[(&str, String)],
+    ) -> crate::Result<serde_json::Value> {
+        let mut pacing = self.stock_pacing.lock().await;
+        let mut failure = None;
+        for attempt in 0..3 {
+            if let Some(at) = *pacing {
+                tokio::time::sleep_until(at + Duration::from_millis(500)).await;
+            }
+            *pacing = Some(tokio::time::Instant::now());
+            let result = async {
+                let mut response = self
+                    .get(url)
+                    .query(query)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await? {
+                    if bytes.len() + chunk.len() > 2_000_000 {
+                        return Err(crate::Error::decode("stock response too large"));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                serde_json::from_slice(&bytes).map_err(|e| crate::Error::decode(e.to_string()))
+            }
+            .await;
+            match result {
+                Ok(v) => return Ok(v),
+                Err(e) if e.kind() == crate::ErrorKind::Decode => return Err(e),
+                Err(e) => failure = Some(e),
+            }
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(1000 * (attempt + 1))).await;
+            }
+        }
+        Err(failure.unwrap_or_else(|| crate::Error::upstream("stock request failed")))
     }
 }

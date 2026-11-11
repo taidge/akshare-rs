@@ -49,3 +49,5 @@ pub mod zh_b;
 pub mod zh_comparison;
 pub mod zh_index;
 pub mod zh_kcb;
+
+pub(crate) mod history_validation;
