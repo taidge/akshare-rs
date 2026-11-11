@@ -22,7 +22,11 @@ impl AkShareClient {
     pub async fn stock_info_a_code_name(&self) -> Result<Vec<StockInfo>> {
         match self.stock_info_a_code_name_exchanges().await {
             Ok(items) => Ok(items),
-            Err(_) => self.stock_info_a_code_name_em().await,
+            Err(primary) => self.stock_info_a_code_name_em().await.map_err(|fallback| {
+                Error::upstream(format!(
+                    "exchange catalog: {primary}; Eastmoney fallback: {fallback}"
+                ))
+            }),
         }
     }
     pub async fn stock_info_a_code_name_exchanges(&self) -> Result<Vec<StockInfo>> {

@@ -206,6 +206,16 @@ impl AkShareClient {
         url: &str,
         query: &[(&str, String)],
     ) -> crate::Result<serde_json::Value> {
+        let bytes = self
+            .stock_bytes(self.get(url).query(query), 2_000_000)
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| crate::Error::decode(e.to_string()))
+    }
+    pub(crate) async fn stock_bytes(
+        &self,
+        builder: reqwest::RequestBuilder,
+        max: usize,
+    ) -> crate::Result<Vec<u8>> {
         let mut pacing = self.stock_pacing.lock().await;
         let mut failure = None;
         for attempt in 0..3 {
@@ -214,25 +224,32 @@ impl AkShareClient {
             }
             *pacing = Some(tokio::time::Instant::now());
             let result = async {
-                let mut response = self
-                    .get(url)
-                    .query(query)
+                let mut response = builder
+                    .try_clone()
+                    .ok_or_else(|| crate::Error::invalid_input("stock request cannot be retried"))?
                     .send()
                     .await?
                     .error_for_status()?;
                 let mut bytes = Vec::new();
                 while let Some(chunk) = response.chunk().await? {
-                    if bytes.len() + chunk.len() > 2_000_000 {
+                    if bytes.len() + chunk.len() > max {
                         return Err(crate::Error::decode("stock response too large"));
                     }
                     bytes.extend_from_slice(&chunk);
                 }
-                serde_json::from_slice(&bytes).map_err(|e| crate::Error::decode(e.to_string()))
+                Ok(bytes)
             }
             .await;
             match result {
                 Ok(v) => return Ok(v),
-                Err(e) if e.kind() == crate::ErrorKind::Decode => return Err(e),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        crate::ErrorKind::Decode | crate::ErrorKind::Restricted
+                    ) =>
+                {
+                    return Err(e);
+                }
                 Err(e) => failure = Some(e),
             }
             if attempt < 2 {

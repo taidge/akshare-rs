@@ -301,7 +301,7 @@ impl AkShareClient {
         let indicator_map =
             std::collections::HashMap::from([("主板A股", "1"), ("主板B股", "2"), ("科创板", "8")]);
         let stock_type = indicator_map.get(symbol).unwrap_or(&"1");
-        let resp = self
+        let builder = self
             .get("https://query.sse.com.cn/sseQuery/commonQuery.do")
             .query(&[
                 ("STOCK_TYPE", *stock_type),
@@ -321,12 +321,9 @@ impl AkShareClient {
             .header(
                 "Referer",
                 "https://www.sse.com.cn/assortment/stock/list/share/",
-            )
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<serde_json::Value>()
-            .await?;
+            );
+        let bytes = self.stock_bytes(builder, 5_000_000).await?;
+        let resp: serde_json::Value = serde_json::from_slice(&bytes)?;
         let data = resp
             .get("result")
             .and_then(|d| d.as_array())
@@ -346,21 +343,15 @@ impl AkShareClient {
             ("AB股列表", "tab4"),
         ]);
         let tab_key = indicator_map.get(symbol).unwrap_or(&"tab1");
-        let resp = self
+        let builder = self
             .get("https://www.szse.cn/api/report/ShowReport")
             .query(&[
                 ("SHOWTYPE", "xlsx"),
                 ("CATALOGID", "1110"),
                 ("TABKEY", *tab_key),
                 ("random", "0.6935816432433362"),
-            ])
-            .send()
-            .await?
-            .error_for_status()?;
-        let bytes = resp.bytes().await?;
-        if bytes.len() > 5_000_000 {
-            return Err(Error::decode("SZSE workbook exceeds limit"));
-        }
+            ]);
+        let bytes = self.stock_bytes(builder, 5_000_000).await?;
         use calamine::{Reader, Xlsx};
         let mut workbook =
             Xlsx::new(std::io::Cursor::new(bytes)).map_err(|e| Error::decode(e.to_string()))?;
@@ -398,26 +389,18 @@ impl AkShareClient {
         let mut seen = std::collections::HashSet::new();
         let mut expected = None;
         for page in 0..150 {
-            let _pace = self.stock_pacing.lock().await;
-            if self.mock_uri.is_none() {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            let response = crate::util::send_and_check(
-                self.post("https://www.bse.cn/nqxxController/nqxxCnzq.do")
-                    .form(&[
-                        ("page", page.to_string()),
-                        ("typejb", "T".into()),
-                        ("xxfcbj[]", "2".into()),
-                        ("xxzqdm", "".into()),
-                        ("sortfield", "xxzqdm".into()),
-                        ("sorttype", "asc".into()),
-                    ]),
-            )
-            .await?;
-            let text = response.text().await?;
-            if text.len() > 2_000_000 {
-                return Err(Error::decode("BSE response exceeds limit"));
-            }
+            let builder = self
+                .post("https://www.bse.cn/nqxxController/nqxxCnzq.do")
+                .form(&[
+                    ("page", page.to_string()),
+                    ("typejb", "T".into()),
+                    ("xxfcbj[]", "2".into()),
+                    ("xxzqdm", "".into()),
+                    ("sortfield", "xxzqdm".into()),
+                    ("sorttype", "asc".into()),
+                ]);
+            let bytes = self.stock_bytes(builder, 2_000_000).await?;
+            let text = String::from_utf8(bytes).map_err(|e| Error::decode(e.to_string()))?;
             let start = text
                 .find('[')
                 .ok_or_else(|| Error::decode("BSE JSONP array missing"))?;
