@@ -151,6 +151,7 @@ pub mod tool;
 mod client;
 mod error;
 pub mod market;
+mod sina_calendar;
 pub mod types;
 mod util;
 
