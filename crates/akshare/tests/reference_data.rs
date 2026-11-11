@@ -64,6 +64,12 @@ async fn factor_and_calendar_http_preserve_actual_source_protocols() {
         )
         .mount(&server)
         .await;
+    Mock::given(path("/realstock/company/bj920130/hfq.js"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"var bj920130hfq={"total":1,"data":[{"d":"1900-01-01","f":"1.0"}]};"#,
+        ))
+        .mount(&server)
+        .await;
     let client = AkShareClient::with_mock(server.uri());
     assert_eq!(
         client
@@ -73,11 +79,13 @@ async fn factor_and_calendar_http_preserve_actual_source_protocols() {
             .factor,
         1.
     );
-    assert!(
+    assert_eq!(
         client
             .stock_adjustment_factors_sina("920130.BJ")
             .await
-            .is_err()
+            .unwrap()[0]
+            .factor,
+        1.
     );
     assert_eq!(
         client.stock_trade_calendar_sina().await.unwrap().len(),
@@ -105,6 +113,11 @@ async fn live_reference_financial_factors_calendar_contract() {
         .await
         .unwrap();
     assert!(factors.len() > 20);
+    let beijing = client
+        .stock_adjustment_factors_sina("920130.BJ")
+        .await
+        .unwrap();
+    assert!(beijing.len() >= 3 && beijing.iter().any(|p| p.date == "2024-06-12"));
     let dates = client.stock_trade_calendar_sina().await.unwrap();
     assert!(dates.len() > 8500);
     println!(

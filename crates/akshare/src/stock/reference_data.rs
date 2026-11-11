@@ -170,11 +170,6 @@ impl AkShareClient {
         symbol: &str,
     ) -> Result<Vec<SinaAdjustmentFactor>> {
         let (code, market) = secucode(symbol)?;
-        if market == "BJ" {
-            return Err(Error::unsupported_market(
-                "Sina factors do not support Beijing equities",
-            ));
-        }
         let security = format!("{}{code}", market.to_ascii_lowercase());
         let body = bounded_text(
             self.get(&format!(
