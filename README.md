@@ -1,4 +1,6 @@
-> taidge fork: repairs full A-share directory pagination (SH/SZ/BJ, listing date and industry),
+> taidge fork: uses the existing SSE/SZSE/BSE directory APIs by default (including repaired
+> SZSE XLSX parsing and BSE JSONP pagination), with a fully paginated Eastmoney fallback.
+> Also repairs full A-share directory pagination (SH/SZ/BJ, listing date and industry),
 > Tencent numeric-string/date parsing, and adds `stock_zh_a_hist_em` (Eastmoney only) plus
 > `stock_zh_a_hist_sourced` (explicit vendor identity and optional source pinning).
 > Daily history requests accept YYYYMMDD / YYYY-MM-DD and at most 731 calendar days per

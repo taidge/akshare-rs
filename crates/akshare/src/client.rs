@@ -210,7 +210,7 @@ impl AkShareClient {
         let mut failure = None;
         for attempt in 0..3 {
             if let Some(at) = *pacing {
-                tokio::time::sleep_until(at + Duration::from_millis(500)).await;
+                tokio::time::sleep_until(at + Duration::from_millis(1000)).await;
             }
             *pacing = Some(tokio::time::Instant::now());
             let result = async {

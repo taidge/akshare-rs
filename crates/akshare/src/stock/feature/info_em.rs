@@ -3,7 +3,7 @@
 use super::helpers::{json_str, json_str_opt};
 use super::types::{DelistInfo, NameChangeInfo, NewsEntry};
 use crate::client::AkShareClient;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 impl AkShareClient {
     /// 东方财富-财经早餐
@@ -358,33 +358,108 @@ impl AkShareClient {
             .await?
             .error_for_status()?;
         let bytes = resp.bytes().await?;
-        // Parse XLSX - return raw bytes info for now
-        // In a full implementation, we'd parse the XLSX file
-        Ok(vec![serde_json::json!({"raw_length": bytes.len()})])
+        if bytes.len() > 5_000_000 {
+            return Err(Error::decode("SZSE workbook exceeds limit"));
+        }
+        use calamine::{Reader, Xlsx};
+        let mut workbook =
+            Xlsx::new(std::io::Cursor::new(bytes)).map_err(|e| Error::decode(e.to_string()))?;
+        let range = workbook
+            .worksheet_range_at(0)
+            .ok_or_else(|| Error::decode("SZSE sheet missing"))?
+            .map_err(|e| Error::decode(e.to_string()))?;
+        let mut rows = range.rows();
+        let headers = rows
+            .next()
+            .ok_or_else(|| Error::decode("SZSE headers missing"))?
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if !headers.iter().any(|h| h.contains("股代码")) {
+            return Err(Error::decode("SZSE stock-code header missing"));
+        }
+        Ok(rows
+            .filter(|r| r.iter().any(|c| !c.to_string().is_empty()))
+            .map(|row| {
+                serde_json::Value::Object(
+                    headers
+                        .iter()
+                        .zip(row)
+                        .map(|(h, v)| (h.clone(), serde_json::Value::String(v.to_string())))
+                        .collect(),
+                )
+            })
+            .collect())
     }
 
     /// 北京证券交易所-股票列表 (Python: stock_info_bj_name_code)
     pub async fn stock_info_bj_name_code(&self) -> Result<Vec<serde_json::Value>> {
-        let resp = self
-            .post("https://www.bse.cn/nqxxController/nqxxCnzq.do")
-            .form(&[
-                ("page", "0"),
-                ("typejb", "T"),
-                ("xxfcbj[]", "2"),
-                ("xxzqdm", ""),
-                ("sortfield", "xxzqdm"),
-                ("sorttype", "asc"),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<serde_json::Value>()
+        let mut all = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut expected = None;
+        for page in 0..150 {
+            let _pace = self.stock_pacing.lock().await;
+            if self.mock_uri.is_none() {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let response = crate::util::send_and_check(
+                self.post("https://www.bse.cn/nqxxController/nqxxCnzq.do")
+                    .form(&[
+                        ("page", page.to_string()),
+                        ("typejb", "T".into()),
+                        ("xxfcbj[]", "2".into()),
+                        ("xxzqdm", "".into()),
+                        ("sortfield", "xxzqdm".into()),
+                        ("sorttype", "asc".into()),
+                    ]),
+            )
             .await?;
-        let data = resp
-            .get("data")
-            .and_then(|d| d.as_array())
-            .cloned()
-            .unwrap_or_default();
-        Ok(data)
+            let text = response.text().await?;
+            if text.len() > 2_000_000 {
+                return Err(Error::decode("BSE response exceeds limit"));
+            }
+            let start = text
+                .find('[')
+                .ok_or_else(|| Error::decode("BSE JSONP array missing"))?;
+            let end = text
+                .rfind(']')
+                .ok_or_else(|| Error::decode("BSE JSONP array incomplete"))?;
+            let value: serde_json::Value = serde_json::from_str(&text[start..=end])?;
+            let data = &value[0];
+            let total = data["totalElements"]
+                .as_u64()
+                .ok_or_else(|| Error::decode("BSE total missing"))?
+                as usize;
+            let pages = data["totalPages"]
+                .as_u64()
+                .ok_or_else(|| Error::decode("BSE pages missing"))?;
+            if pages > 150
+                || pages == 0
+                || expected.is_some_and(|n| n != total)
+                || data["number"].as_u64() != Some(page)
+            {
+                return Err(Error::decode("BSE pagination changed or invalid"));
+            }
+            expected = Some(total);
+            let rows = data["content"]
+                .as_array()
+                .ok_or_else(|| Error::decode("BSE content missing"))?;
+            for row in rows {
+                let code = row["xxzqdm"]
+                    .as_str()
+                    .ok_or_else(|| Error::decode("BSE stock code missing"))?;
+                if !seen.insert(code.to_owned()) {
+                    return Err(Error::decode("BSE duplicate stock code"));
+                }
+                all.push(row.clone());
+            }
+            if page + 1 == pages {
+                break;
+            }
+        }
+        if Some(all.len()) != expected {
+            return Err(Error::decode("BSE incomplete directory"));
+        }
+        Ok(all)
     }
 }
